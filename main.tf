@@ -96,6 +96,21 @@ data "archive_file" "lambda_zip" {
   type        = "zip"
   source_dir  = "${path.module}/lambda"
   output_path = "${path.module}/lambda.zip"
+  excludes    = ["layer"]
+}
+
+# Lambda Layer
+data "archive_file" "lambda_layer_zip" {
+  type        = "zip"
+  source_dir  = "${path.module}/lambda/layer"
+  output_path = "${path.module}/lambda_layer.zip"
+}
+
+resource "aws_lambda_layer_version" "redis_layer" {
+  layer_name          = "redis-layer"
+  filename            = data.archive_file.lambda_layer_zip.output_path
+  source_code_hash    = data.archive_file.lambda_layer_zip.output_base64sha256
+  compatible_runtimes = ["python3.11"]
 }
 
 resource "aws_iam_role" "lambda_exec_role" {
@@ -159,6 +174,7 @@ resource "aws_lambda_function" "bedrock_proxy" {
   filename         = data.archive_file.lambda_zip.output_path
   source_code_hash = data.archive_file.lambda_zip.output_base64sha256
   timeout          = 30
+  layers           = [aws_lambda_layer_version.redis_layer.arn]
 
   vpc_config {
     subnet_ids         = [aws_subnet.private_a.id, aws_subnet.private_b.id]
