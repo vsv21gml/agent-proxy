@@ -29,7 +29,7 @@ def lambda_handler(event, context):
 
     body = event.get('body', {})
     api_key = event.get('headers', {}).get('x-api-key')
-    prompt = body.get('prompt')
+    prompt = body.get('inputText')
     agent_id = body.get('agentId')
     agent_alias_id = body.get('agentAliasId')
 
