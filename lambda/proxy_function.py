@@ -31,7 +31,6 @@ def lambda_handler(event, context):
 
         # Bedrock Agent 호출
         response = invoke_bedrock_agent(event)
-        print('invoke_bedrock_agent success')
         print(response)
         
         # 응답 후 추가 메트릭 기록
@@ -63,6 +62,7 @@ def get_redis_client():
     redis_client = redis.Redis(
         host=redis_host,
         port=redis_port,
+        ssl=True,
         decode_responses=True,
         socket_connect_timeout=10,
         socket_timeout=10,
@@ -85,7 +85,6 @@ def check_rate_limit(redis_conn, api_key):
     """
     Redis를 사용한 유량 제어 (Sliding Window Counter)
     """
-    print(f"check_rate_limit key={api_key}")
     current_time = int(time.time())
     window_size = 60  # 1분 윈도우
     max_requests = get_rate_limit_for_user(redis_conn, api_key)  # 사용자별 제한
@@ -119,6 +118,7 @@ def check_rate_limit(redis_conn, api_key):
             
             # 가중 평균으로 요청 수 계산
             estimated_count = int(prev_count * (1 - elapsed_ratio) + current_count)
+            print(f"estimated_count={estimated_count} max_requests={max_requests}")
             
             if estimated_count > max_requests:
                 # 초과한 경우 현재 요청 취소
@@ -215,11 +215,6 @@ def invoke_bedrock_agent(event):
         
         if not agent_id or not input_text:
             raise ValueError("agentId and inputText are required")
-
-        print(f"agent_id={agent_id}")
-        print(f"agent_alias_id={agent_alias_id}")
-        print(f"sessionId={session_id}")
-        print(f"inputText={input_text}")
         
         # Bedrock Agent 클라이언트
         bedrock_agent = boto3.client('bedrock-agent-runtime', region_name='us-east-1')
@@ -233,10 +228,8 @@ def invoke_bedrock_agent(event):
         # 스트리밍 응답 처리
         result = ""
         for event in response.get('completion', []):
-            print(event)
             if 'chunk' in event:
                 chunk = event['chunk']
-                print(f"chunk={chunk}")
                 if 'bytes' in chunk:
                     result += chunk['bytes'].decode('utf-8')
         
