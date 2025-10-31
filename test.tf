@@ -2,7 +2,7 @@
 # test.tf
 
 data "aws_lambda_invocation" "test_proxy_function" {
-  function_name = aws_lambda_function.proxy_function.function_name
+  function_name = aws_lambda_function.bedrock_proxy.function_name
   input         = file("${path.module}/test.json")
 }
 
