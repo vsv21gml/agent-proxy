@@ -1,142 +1,277 @@
-import os
 import json
-import redis
 import boto3
 import time
-import uuid
-
+import os
+from datetime import datetime, timedelta
+import hashlib
+from rediscluster import RedisCluster
+import redis
 import socket
+import urllib3
 import errno
 
-# 환경 변수에서 설정값 가져오기
-REDIS_HOST = 'bedrock-proxy-redis-001.bedrock-proxy-redis.bop0j9.use1.cache.amazonaws.com'
-REDIS_PORT = int(os.environ.get('REDIS_PORT', 6379))
-RPM_LIMIT = int(os.environ.get('RPM_LIMIT', 100))
-TPM_LIMIT = int(os.environ.get('TPM_LIMIT', 10000))
+def get_redis_client():
+    """Redis 클라이언트 연결 (연결 풀 사용)"""
+    redis_host = os.environ.get('REDIS_HOST')
+    redis_port = int(os.environ.get('REDIS_PORT', 6379))
+    
+    redis_client = redis.Redis(
+        host=redis_host,
+        port=redis_port,
+        decode_responses=True,
+        socket_connect_timeout=10,
+        socket_timeout=10,
+        retry_on_timeout=True,
+        max_connections=5
+    )
 
-# Redis 및 Bedrock 클라이언트 초기화
-redis_client = None
-try:
-    redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, ssl=True, decode_responses=True)
+    # 연결 테스트
     redis_client.ping()
     print("redis connection established")
-except redis.exceptions.ConnectionError as e:
-    print(f"Redis 연결에 실패했습니다: {e}")
-    redis_client = None
 
-bedrock_agent_runtime_client = boto3.client('bedrock-agent-runtime')
+    return redis_client
+
+# Bedrock Agent 클라이언트
+bedrock_agent = boto3.client('bedrock-agent-runtime', region_name='us-east-1')
 
 def lambda_handler(event, context):
-    conn_test = test_network_connectivity(event)
-    if not conn_test:
-        return {
-            'statusCode': 500,
-            'body': json.dumps({'error': 'Connection Error'})
-        }
+    print(event)
+    try:
+        # API Key 또는 사용자 식별
+        api_key = get_api_key(event)
+        if not api_key:
+            return error_response(401, "API Key required")
+        
+        # Redis 연결
+        redis_conn = get_redis_client()
+        
+        # 유량 제어 검사
+        rate_limit_result = check_rate_limit(redis_conn, api_key)
+        if not rate_limit_result['allowed']:
+            return error_response(429, "Rate limit exceeded", {
+                'X-Rate-Limit-Remaining': '0',
+                'X-Rate-Limit-Reset': str(rate_limit_result['reset_time'])
+            })
+        print('rate_limit check success')
+        
+        # 사용량 기록
+        log_usage(redis_conn, api_key)
+        print('log_usage success')
+        
+        # Bedrock Connection Test
+        # conn_test = test_network_connectivity(event)
+        # if not conn_test:
+        #     return error_response(400, "Connection Fail")
 
-    if not redis_client:
+        # Bedrock Agent 호출
+        response = invoke_bedrock_agent(event)
+        print('invoke_bedrock_agent success')
+        print(response)
+        
+        # 응답 후 추가 메트릭 기록
+        # log_response_metrics(redis_conn, api_key, response)
+        # print('log_response_metrics success')
+        
         return {
-            'statusCode': 500,
-            'body': json.dumps({'error': 'Redis 클라이언트를 초기화할 수 없습니다.'})
-        }
-
-    body = event.get('body', {})
-    api_key = event.get('headers', {}).get('x-api-key')
-    prompt = body.get('inputText')
-    agent_id = body.get('agentId')
-    agent_alias_id = body.get('agentAliasId')
-
-    if not all([api_key, prompt, agent_id, agent_alias_id]):
-        return {
-            'statusCode': 400,
-            'body': json.dumps({'error': 'x-api-key, prompt, agentId, agentAliasId는 필수 필드입니다.'})
+            'statusCode': 200,
+            'headers': {
+                'Content-Type': 'application/json',
+                'X-Rate-Limit-Remaining': str(rate_limit_result['remaining']),
+                'X-Rate-Limit-Reset': str(rate_limit_result['reset_time'])
+            },
+            'body': json.dumps(response)
         }
         
-    # 대략적인 토큰 수 계산 (단순히 4글자를 1토큰으로 가정)
-    # 실제로는 Bedrock의 토크나이저를 사용하는 것이 더 정확합니다.
-    prompt_tokens = len(prompt) // 4 
+    except redis.RedisError as e:
+        print(f"Redis error: {str(e)}")
+        return error_response(503, "Service temporarily unavailable")
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        return error_response(500, "Internal server error")
 
-    # --- RPM 및 TPM 체크 ---
-    current_minute = int(time.time() // 60)
-    rpm_key = f"{api_key}:{current_minute}:rpm"
-    tpm_key = f"{api_key}:{current_minute}:tpm"
-    print(f"current_minute=${current_minute} rpm_key=${rpm_key}")
+def get_api_key(event):
+    """API Key 추출"""
+    headers = event.get('headers', {})
+    return headers.get('x-api-key') or headers.get('Authorization', '').replace('Bearer ', '')
 
-    # 파이프라인을 사용하여 원자적 연산 수행
+def check_rate_limit(redis_conn, api_key):
+    """
+    Redis를 사용한 유량 제어 (Sliding Window Counter)
+    """
+    print(f"check_rate_limit key={api_key}")
+    current_time = int(time.time())
+    window_size = 60  # 1분 윈도우
+    max_requests = get_rate_limit_for_user(redis_conn, api_key)  # 사용자별 제한
+    
+    # Redis key
+    key = f"rate_limit:{{{api_key}}}:{current_time // window_size}"
+    
     try:
-        with redis_client.pipeline() as pipeline:
+        with redis_conn.pipeline() as pipe:
             # 트랜잭션 시작
-            pipeline.multi()
-
-            pipeline.incr(rpm_key)
-            pipeline.expire(rpm_key, 60)
-            pipeline.get(rpm_key)
+            pipe.multi()
             
-            pipeline.incrby(tpm_key, prompt_tokens)
-            pipeline.expire(tpm_key, 60)
-            pipeline.get(tpm_key)
+            # 현재 카운트 증가
+            pipe.incr(key)
             
-            results = pipeline.execute()
-            print(results)
-
-            current_rpm = int(results[2])
-            current_tpm = int(results[5])
-            print(f"current_rpm={current_rpm}")
-
-            if current_rpm > RPM_LIMIT:
+            # TTL 설정 (윈도우 크기의 2배)
+            pipe.expire(key, window_size * 2)
+            
+            # 실행
+            results = pipe.execute()
+            current_count = results[0]
+            
+            # 이전 윈도우도 확인 (더 정확한 sliding window)
+            prev_key = f"rate_limit:{api_key}:{(current_time // window_size) - 1}"
+            prev_count = redis_conn.get(prev_key) or 0
+            prev_count = int(prev_count)
+            
+            # 현재 시간이 윈도우에서 차지하는 비율
+            window_start = (current_time // window_size) * window_size
+            elapsed_ratio = (current_time - window_start) / window_size
+            
+            # 가중 평균으로 요청 수 계산
+            estimated_count = int(prev_count * (1 - elapsed_ratio) + current_count)
+            
+            if estimated_count > max_requests:
+                # 초과한 경우 현재 요청 취소
+                redis_conn.decr(key)
                 return {
-                    'statusCode': 429,
-                    'body': json.dumps({'error': f'분당 요청 한도({RPM_LIMIT} RPM)를 초과했습니다.'})
+                    'allowed': False,
+                    'remaining': 0,
+                    'reset_time': window_start + window_size
                 }
             
-            if current_tpm > TPM_LIMIT:
-                # 이미 증가된 토큰 수를 롤백
-                redis_client.decrby(tpm_key, prompt_tokens)
-                return {
-                    'statusCode': 429,
-                    'body': json.dumps({'error': f'분당 토큰 한도({TPM_LIMIT} TPM)를 초과했습니다.'})
-                }
-
+            return {
+                'allowed': True,
+                'remaining': max(0, max_requests - estimated_count),
+                'reset_time': window_start + window_size
+            }
+            
     except Exception as e:
         print(f"Rate limit check error: {str(e)}")
         # Redis 오류시 기본적으로 허용 (fallback)
-        return {
-            'statusCode': 429,
-            'body': json.dumps({'error': f'Redis Error'})
-        }
+        return {'allowed': True, 'remaining': max_requests, 'reset_time': current_time + window_size}
 
-    # --- Bedrock Agent 호출 ---
-    session_id = str(uuid.uuid4()) # 각 요청마다 고유 세션 ID 생성
+def get_rate_limit_for_user(redis_conn, api_key):
+    # 캐시에서 사용자 등급 조회
+    user_tier_key = f"user_tier:{api_key}"
+    user_tier = redis_conn.get(user_tier_key) or 'free'
     
+    # 등급별 제한
+    rate_limits = {
+        'free': 5,      # 분당 10개
+        'premium': 60,   # 분당 60개
+        'enterprise': 300 # 분당 300개
+    }
+    
+    return rate_limits.get(user_tier, 10)
+
+def log_usage(redis_conn, api_key):
+    """사용량 기록 (다양한 시간 단위)"""
+    current_time = int(time.time())
+    current_date = datetime.utcnow().strftime('%Y-%m-%d')
+    current_hour = datetime.utcnow().strftime('%Y-%m-%d:%H')
+    
+    with redis_conn.pipeline() as pipe:
+        pipe.multi()
+        
+        # 해시 태그 {api_key}를 사용하여 모든 키가 같은 슬롯에 저장되도록 함
+        minute_key = f"usage:minute:{{{api_key}}}:{current_time // 60}"
+        pipe.incr(minute_key)
+        pipe.expire(minute_key, 3600)
+        
+        hour_key = f"usage:hour:{{{api_key}}}:{current_hour}"
+        pipe.incr(hour_key)
+        pipe.expire(hour_key, 86400 * 7)
+        
+        daily_key = f"usage:daily:{{{api_key}}}:{current_date}"
+        pipe.incr(daily_key)
+        pipe.expire(daily_key, 86400 * 30)
+        
+        total_key = f"usage:total:{{{api_key}}}"
+        pipe.incr(total_key)
+        
+        pipe.execute()
+
+def log_response_metrics(redis_conn, api_key, response):
+    """응답 메트릭 기록"""
+    current_time = int(time.time())
+    
+    # 응답 크기 계산
+    response_size = len(json.dumps(response).encode('utf-8'))
+    
+    with redis_conn.pipeline() as pipe:
+        pipe.multi()
+        
+        # 응답 크기 누적
+        size_key = f"metrics:response_size:{api_key}"
+        pipe.incrby(size_key, response_size)
+        pipe.expire(size_key, 86400)  # 1일 보관
+        
+        # 성공 카운트
+        success_key = f"metrics:success:{api_key}:{current_time // 3600}"
+        pipe.incr(success_key)
+        pipe.expire(success_key, 86400 * 7)  # 7일 보관
+        
+        pipe.execute()
+
+def invoke_bedrock_agent(event):
+    """Bedrock Agent 호출"""
     try:
-        print(f"session_id=${session_id}")
-        response = bedrock_agent_runtime_client.invoke_agent(
+        body = event.get('body', {})
+        
+        agent_id = body.get('agentId')
+        agent_alias_id = body.get('agentAliasId', 'TSTALIASID')
+        session_id = body.get('sessionId', f"session-{int(time.time())}")
+        input_text = body.get('inputText', '')
+        
+        if not agent_id or not input_text:
+            raise ValueError("agentId and inputText are required")
+
+        print(f"agent_id={agent_id}")
+        print(f"agent_alias_id={agent_alias_id}")
+        print(f"sessionId={session_id}")
+        print(f"inputText={input_text}")
+        
+        response = bedrock_agent.invoke_agent(
             agentId=agent_id,
             agentAliasId=agent_alias_id,
             sessionId=session_id,
-            inputText=prompt,
+            inputText=input_text
         )
-
-        completion_text = ""
+        
+        # 스트리밍 응답 처리
+        result = ""
         for event in response.get('completion', []):
+            print(event)
             if 'chunk' in event:
                 chunk = event['chunk']
-                completion_text += chunk['bytes'].decode('utf-8')
-
+                print(f"chunk={chunk}")
+                if 'bytes' in chunk:
+                    result += chunk['bytes'].decode('utf-8')
+        
         return {
-            'statusCode': 200,
-            'body': json.dumps({'response': completion_text})
+            'sessionId': session_id,
+            'response': result,
+            'agentId': agent_id,
+            'timestamp': datetime.utcnow().isoformat()
         }
+        
     except Exception as e:
-        print(f"Bedrock Agent 호출 중 오류 발생: {e}")
-        # 오류 발생 시 TPM/RPM 롤백
-        redis_client.decr(rpm_key)
-        redis_client.decrby(tpm_key, prompt_tokens)
-        return {
-            'statusCode': 500,
-            'body': json.dumps({'error': 'Bedrock Agent를 호출하는 동안 오류가 발생했습니다.'})
-        }
+        raise Exception(f"Bedrock Agent invocation failed: {str(e)}")
 
+def error_response(status_code, message, additional_headers=None):
+    """에러 응답"""
+    headers = {'Content-Type': 'application/json'}
+    if additional_headers:
+        headers.update(additional_headers)
+    
+    return {
+        'statusCode': status_code,
+        'headers': headers,
+        'body': json.dumps({'error': message})
+    }
 
 def test_network_connectivity(event):
     """네트워크 연결 상태를 테스트하는 함수"""
