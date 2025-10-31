@@ -8,7 +8,10 @@ data "aws_region" "current" {}
 
 # 네트워킹 설정 (VPC, Subnets, Security Groups)
 resource "aws_vpc" "main" {
-  cidr_block = "10.0.0.0/16"
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_hostnames = true  # VPC 엔드포인트 사용을 위해 필요
+  enable_dns_support   = true  # VPC 엔드포인트 사용을 위해 필요
+  
   tags = {
     Name = "bedrock-proxy-vpc"
   }
@@ -32,16 +35,43 @@ resource "aws_subnet" "private_b" {
   }
 }
 
+# VPC 엔드포인트용 보안 그룹
+resource "aws_security_group" "vpc_endpoint_sg" {
+  name        = "vpc-endpoint-sg"
+  description = "Security group for VPC endpoints"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port       = 443
+    to_port         = 443
+    protocol        = "tcp"
+    security_groups = [aws_security_group.lambda_sg.id]
+  }
+
+  tags = {
+    Name = "bedrock-proxy-vpc-endpoint-sg"
+  }
+}
+
 resource "aws_security_group" "lambda_sg" {
   name        = "lambda-sg"
   description = "Security group for Lambda function"
   vpc_id      = aws_vpc.main.id
 
+  # ElastiCache 접근용
   egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
+    from_port       = 6379
+    to_port         = 6379
+    protocol        = "tcp"
+    security_groups = [aws_security_group.elasticache_sg.id]
+  }
+
+  # VPC 엔드포인트 접근용 (Bedrock)
+  egress {
+    from_port       = 443
+    to_port         = 443
+    protocol        = "tcp"
+    security_groups = [aws_security_group.vpc_endpoint_sg.id]
   }
 
   tags = {
@@ -63,6 +93,94 @@ resource "aws_security_group" "elasticache_sg" {
 
   tags = {
     Name = "bedrock-proxy-elasticache-sg"
+  }
+}
+
+# Bedrock VPC 엔드포인트
+resource "aws_vpc_endpoint" "bedrock" {
+  vpc_id              = aws_vpc.main.id
+  service_name        = "com.amazonaws.${var.aws_region}.bedrock"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [aws_subnet.private_a.id, aws_subnet.private_b.id]
+  security_group_ids  = [aws_security_group.vpc_endpoint_sg.id]
+  
+  private_dns_enabled = true
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = "*"
+        Action = [
+          "bedrock:*"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+
+  tags = {
+    Name = "bedrock-vpc-endpoint"
+  }
+}
+
+# Bedrock Runtime VPC 엔드포인트 (모델 실행용)
+resource "aws_vpc_endpoint" "bedrock_runtime" {
+  vpc_id              = aws_vpc.main.id
+  service_name        = "com.amazonaws.${var.aws_region}.bedrock-runtime"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [aws_subnet.private_a.id, aws_subnet.private_b.id]
+  security_group_ids  = [aws_security_group.vpc_endpoint_sg.id]
+  
+  private_dns_enabled = true
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = "*"
+        Action = [
+          "bedrock:InvokeModel",
+          "bedrock:InvokeModelWithResponseStream"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+
+  tags = {
+    Name = "bedrock-runtime-vpc-endpoint"
+  }
+}
+
+# Bedrock Agent VPC 엔드포인트 (Agent용)
+resource "aws_vpc_endpoint" "bedrock_agent_runtime" {
+  vpc_id              = aws_vpc.main.id
+  service_name        = "com.amazonaws.${var.aws_region}.bedrock-agent-runtime"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [aws_subnet.private_a.id, aws_subnet.private_b.id]
+  security_group_ids  = [aws_security_group.vpc_endpoint_sg.id]
+  
+  private_dns_enabled = true
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = "*"
+        Action = [
+          "bedrock:InvokeAgent"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+
+  tags = {
+    Name = "bedrock-agent-runtime-vpc-endpoint"
   }
 }
 
@@ -88,8 +206,6 @@ resource "aws_elasticache_replication_group" "main" {
   transit_encryption_enabled    = true
   at_rest_encryption_enabled    = true
 }
-
-
 
 # Lambda 프록시 함수 설정
 data "archive_file" "lambda_zip" {
@@ -189,4 +305,11 @@ resource "aws_lambda_function" "bedrock_proxy" {
       TPM_LIMIT       = "10000"
     }
   }
+
+  # VPC 엔드포인트가 생성된 후 Lambda 함수 생성
+  depends_on = [
+    aws_vpc_endpoint.bedrock,
+    aws_vpc_endpoint.bedrock_runtime,
+    aws_vpc_endpoint.bedrock_agent_runtime
+  ]
 }
