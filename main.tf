@@ -35,44 +35,11 @@ resource "aws_subnet" "private_b" {
   }
 }
 
-# VPC 엔드포인트용 보안 그룹
-resource "aws_security_group" "vpc_endpoint_sg" {
-  name        = "vpc-endpoint-sg"
-  description = "Security group for VPC endpoints"
-  vpc_id      = aws_vpc.main.id
-
-  ingress {
-    from_port       = 443
-    to_port         = 443
-    protocol        = "tcp"
-    security_groups = [aws_security_group.lambda_sg.id]
-  }
-
-  tags = {
-    Name = "bedrock-proxy-vpc-endpoint-sg"
-  }
-}
-
+# 보안 그룹들 (규칙 없이 먼저 생성)
 resource "aws_security_group" "lambda_sg" {
   name        = "lambda-sg"
   description = "Security group for Lambda function"
   vpc_id      = aws_vpc.main.id
-
-  # ElastiCache 접근용
-  egress {
-    from_port       = 6379
-    to_port         = 6379
-    protocol        = "tcp"
-    security_groups = [aws_security_group.elasticache_sg.id]
-  }
-
-  # VPC 엔드포인트 접근용 (Bedrock)
-  egress {
-    from_port       = 443
-    to_port         = 443
-    protocol        = "tcp"
-    security_groups = [aws_security_group.vpc_endpoint_sg.id]
-  }
 
   tags = {
     Name = "bedrock-proxy-lambda-sg"
@@ -84,16 +51,56 @@ resource "aws_security_group" "elasticache_sg" {
   description = "Security group for ElastiCache cluster"
   vpc_id      = aws_vpc.main.id
 
-  ingress {
-    from_port       = 6379
-    to_port         = 6379
-    protocol        = "tcp"
-    security_groups = [aws_security_group.lambda_sg.id]
-  }
-
   tags = {
     Name = "bedrock-proxy-elasticache-sg"
   }
+}
+
+resource "aws_security_group" "vpc_endpoint_sg" {
+  name        = "vpc-endpoint-sg"
+  description = "Security group for VPC endpoints"
+  vpc_id      = aws_vpc.main.id
+
+  tags = {
+    Name = "bedrock-proxy-vpc-endpoint-sg"
+  }
+}
+
+# 보안 그룹 규칙들을 별도로 정의
+resource "aws_security_group_rule" "lambda_to_elasticache" {
+  type                     = "egress"
+  from_port                = 6379
+  to_port                  = 6379
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.elasticache_sg.id
+  security_group_id        = aws_security_group.lambda_sg.id
+}
+
+resource "aws_security_group_rule" "lambda_to_vpc_endpoint" {
+  type                     = "egress"
+  from_port                = 443
+  to_port                  = 443
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.vpc_endpoint_sg.id
+  security_group_id        = aws_security_group.lambda_sg.id
+}
+
+resource "aws_security_group_rule" "elasticache_from_lambda" {
+  type                     = "ingress"
+  from_port                = 6379
+  to_port                  = 6379
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.lambda_sg.id
+  security_group_id        = aws_security_group.elasticache_sg.id
+}
+
+resource "aws_security_group_rule" "vpc_endpoint_from_lambda" {
+  type                     = "ingress"
+  from_port                = 443
+  to_port                  = 443
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.lambda_sg.id
+  security_group_id        = aws_security_group.vpc_endpoint_sg.id
 }
 
 # Bedrock VPC 엔드포인트
@@ -310,6 +317,8 @@ resource "aws_lambda_function" "bedrock_proxy" {
   depends_on = [
     aws_vpc_endpoint.bedrock,
     aws_vpc_endpoint.bedrock_runtime,
-    aws_vpc_endpoint.bedrock_agent_runtime
+    aws_vpc_endpoint.bedrock_agent_runtime,
+    aws_security_group_rule.lambda_to_elasticache,
+    aws_security_group_rule.lambda_to_vpc_endpoint
   ]
 }
