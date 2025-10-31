@@ -2,37 +2,8 @@ import json
 import boto3
 import time
 import os
-from datetime import datetime, timedelta
-import hashlib
-from rediscluster import RedisCluster
+from datetime import datetime
 import redis
-import socket
-import urllib3
-import errno
-
-def get_redis_client():
-    """Redis 클라이언트 연결 (연결 풀 사용)"""
-    redis_host = os.environ.get('REDIS_HOST')
-    redis_port = int(os.environ.get('REDIS_PORT', 6379))
-    
-    redis_client = redis.Redis(
-        host=redis_host,
-        port=redis_port,
-        decode_responses=True,
-        socket_connect_timeout=10,
-        socket_timeout=10,
-        retry_on_timeout=True,
-        max_connections=5
-    )
-
-    # 연결 테스트
-    redis_client.ping()
-    print("redis connection established")
-
-    return redis_client
-
-# Bedrock Agent 클라이언트
-bedrock_agent = boto3.client('bedrock-agent-runtime', region_name='us-east-1')
 
 def lambda_handler(event, context):
     print(event)
@@ -57,11 +28,6 @@ def lambda_handler(event, context):
         # 사용량 기록
         log_usage(redis_conn, api_key)
         print('log_usage success')
-        
-        # Bedrock Connection Test
-        # conn_test = test_network_connectivity(event)
-        # if not conn_test:
-        #     return error_response(400, "Connection Fail")
 
         # Bedrock Agent 호출
         response = invoke_bedrock_agent(event)
@@ -88,6 +54,27 @@ def lambda_handler(event, context):
     except Exception as e:
         print(f"Error: {str(e)}")
         return error_response(500, "Internal server error")
+
+def get_redis_client():
+    """Redis 클라이언트 연결 (연결 풀 사용)"""
+    redis_host = os.environ.get('REDIS_HOST')
+    redis_port = int(os.environ.get('REDIS_PORT', 6379))
+    
+    redis_client = redis.Redis(
+        host=redis_host,
+        port=redis_port,
+        decode_responses=True,
+        socket_connect_timeout=10,
+        socket_timeout=10,
+        retry_on_timeout=True,
+        max_connections=5
+    )
+
+    # 연결 테스트
+    redis_client.ping()
+    print("redis connection established")
+
+    return redis_client
 
 def get_api_key(event):
     """API Key 추출"""
@@ -234,6 +221,8 @@ def invoke_bedrock_agent(event):
         print(f"sessionId={session_id}")
         print(f"inputText={input_text}")
         
+        # Bedrock Agent 클라이언트
+        bedrock_agent = boto3.client('bedrock-agent-runtime', region_name='us-east-1')
         response = bedrock_agent.invoke_agent(
             agentId=agent_id,
             agentAliasId=agent_alias_id,
@@ -272,103 +261,3 @@ def error_response(status_code, message, additional_headers=None):
         'headers': headers,
         'body': json.dumps({'error': message})
     }
-
-def test_network_connectivity(event):
-    """네트워크 연결 상태를 테스트하는 함수"""
-    
-    # 1. 더 자세한 네트워크 진단
-    try:
-        print("🔍 상세 네트워크 진단 시작...")
-        
-        # DNS 해상도
-        hostname = 'httpbin.org'
-        ip = socket.gethostbyname(hostname)
-        print(f"✅ DNS: {hostname} -> {ip}")
-        
-        # 여러 포트로 연결 테스트
-        ports = [80, 443, 8080]
-        for port in ports:
-            try:
-                print(f"🔌 {ip}:{port} 연결 테스트...")
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(15)  # 타임아웃 늘림
-                
-                start_time = time.time()
-                result = sock.connect_ex((ip, port))
-                elapsed = time.time() - start_time
-                
-                if result == 0:
-                    print(f"✅ 포트 {port} 연결 성공 ({elapsed:.2f}초)")
-                else:
-                    error_msg = errno.errorcode.get(result, f"Unknown error {result}")
-                    print(f"❌ 포트 {port} 연결 실패: {result} ({error_msg}) - {elapsed:.2f}초")
-                
-                sock.close()
-            except Exception as e:
-                print(f"❌ 포트 {port} 연결 예외: {e}")
-        
-        # 간단한 AWS 서비스 연결 테스트
-        print("🔍 AWS 서비스 연결 테스트...")
-        aws_endpoints = [
-            ('s3.amazonaws.com', 443),
-            ('ec2.amazonaws.com', 443)
-        ]
-        
-        for endpoint, port in aws_endpoints:
-            try:
-                aws_ip = socket.gethostbyname(endpoint)
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(10)
-                result = sock.connect_ex((aws_ip, port))
-                sock.close()
-                
-                if result == 0:
-                    print(f"✅ AWS {endpoint} 연결 성공")
-                else:
-                    print(f"❌ AWS {endpoint} 연결 실패: {result}")
-            except Exception as e:
-                print(f"❌ AWS {endpoint} 연결 예외: {e}")
-        
-    except Exception as e:
-        print(f"❌ 진단 실패: {e}")
-        return False
-
-
-    try:
-        print("🔍 DNS 해상도 테스트...")
-        ip = socket.gethostbyname('httpbin.org')
-        print(f"✅ DNS 해상도 성공: httpbin.org -> {ip}")
-    except Exception as e:
-        print(f"❌ DNS 해상도 실패: {e}")
-        return False
-    
-    # 2. 간단한 연결 테스트
-    try:
-        print("🔌 소켓 연결 테스트...")
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(10)
-        result = sock.connect_ex((ip, 80))
-        sock.close()
-        
-        if result == 0:
-            print("✅ 소켓 연결 성공")
-        else:
-            print(f"❌ 소켓 연결 실패: {result}")
-            return False
-    except Exception as e:
-        print(f"❌ 소켓 연결 오류: {e}")
-        return False
-    
-    # 3. HTTP 요청 테스트
-    try:
-        print("🌐 HTTP 요청 테스트...")
-        http = urllib3.PoolManager()
-        response = http.request('GET', 'http://httpbin.org/ip', timeout=10)
-        print(f"✅ HTTP 요청 성공: {response.status}")
-        print(f"응답: {response.data.decode('utf-8')}")
-    except Exception as e:
-        print(f"❌ HTTP 요청 실패: {e}")
-        return False
-    
-    return True
-    
